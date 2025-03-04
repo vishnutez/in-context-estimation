@@ -1,0 +1,5 @@
+model:
+    family: gpt2_estimation
+    n_embd: 64
+    n_layer: 12
+    n_head: 2
