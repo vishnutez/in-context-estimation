@@ -5,6 +5,8 @@ Official implementation of the paper: "Transformers are Provably Optimal In-cont
 Install the dependencies
 
 > conda env create -f environment.yml
+
+Enter the directory
 > cd src
 
 Run the following for training:
