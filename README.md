@@ -5,6 +5,7 @@ Official implementation of the paper: "Transformers are Provably Optimal In-cont
 Install the dependencies
 
 > conda env create -f environment.yml
+> cd src
 
 Run the following for training:
 > WANDB=offline python3 train_detection.py --config `conf/<config-file-name>`
