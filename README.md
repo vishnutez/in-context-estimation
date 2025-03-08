@@ -7,7 +7,7 @@ Install the dependencies
 > conda env create -f environment.yml
 
 Enter the directory
-> cd src
+> cd src/
 
 Run the following for training:
 > WANDB=offline python3 train_detection.py --config `conf/<config-file-name>`
