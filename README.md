@@ -23,7 +23,7 @@ where `<config-file-name>` represents the model to be trained in `conf/` folder.
 
 The trained models are saved in `models/<task-name>/<run-id>` directory. To get the result plots with the model, run:
 ```bash
-python3 detection_time_variant_process.py <task-name> <run-id>
+python3 detection_time_variant_process.py <run-id> <task-name>
 ```
 
 The files are saved in `files/<task-name>.npy` and plots in `plots/<task-name>_<model-name>.png`.
