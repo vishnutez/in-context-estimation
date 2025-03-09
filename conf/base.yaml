@@ -1,5 +1,6 @@
 inherit: 
-    # - models/standard.yaml
+    - models/custom.yaml
+
     # - models/demb128_nl4_nh2.yaml
     # - models/demb128_nl12_nh4.yaml
     # - models/demb64_nl8_nh1.yaml
@@ -14,12 +15,12 @@ inherit:
     # - models/demb32_nl12_nh1.yaml
     # - models/demb64_nl12_nh2.yaml
 
-    - models/demb256_nl4_nh8.yaml
+    # - models/demb256_nl4_nh8.yaml
     # - models/demb256_nl6_nh8.yaml
     # - models/demb256_nl8_nh8.yaml
     # - models/demb256_nl10_nh8.yaml
 
-    - wandb.yaml
+    # - wandb.yaml
 
 model:
     n_dims: 5

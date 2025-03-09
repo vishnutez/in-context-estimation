@@ -24,7 +24,7 @@ training:
             inc: 1
             interval: 2000
 
-out_dir: ../models/detection_time_invariant_snr_neg2_16_qam
+out_dir: ../models/detection-time-invariant-snr-neg2-16qam
 
 wandb:
     name: "detection_time_invariant_snr_0_posencOFF_currON_normOFF"

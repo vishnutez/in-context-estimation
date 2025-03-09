@@ -11,7 +11,7 @@ import torch
 import yaml
 
 from eval import get_run_metrics
-from tasks import get_task_sampler, PolynomialsUnbiasedPoints, HaarWavelets, LinearRegressionRegVecEst
+from tasks import get_task_sampler
 from samplers import get_data_sampler, sample_scale
 from curriculum import Curriculum
 from schema import schema
@@ -19,8 +19,8 @@ from models import build_model, InverseProblemTransformerModel, InverseProblemBi
 from eval import eval_model, load_into_model_from_run
 from eval_encoders import bert_eval_with_masking
 import pickle
-from KS_monomial_sets import monomial_terms
-from torch.distributions.multivariate_normal import MultivariateNormal
+# from KS_monomial_sets import monomial_terms
+# from torch.distributions.multivariate_normal import MultivariateNormal
 
 from samplers import SignalSampler, SignalSamplerQAM
 
@@ -270,46 +270,46 @@ def train(model, args):
     data_sampler = get_data_sampler(args.training.data, n_dims=n_dims, **data_kwargs)
 
     excess_tensors = {}
-    excess_tensors_eval = {}
-    if args.training.task == "polynomials_unbiased_points":
-        excess_tensors["tens"] = torch.empty(0, curriculum.n_points)
-        excess_tensors_eval["tens"] = torch.empty(
-            0, 2 * args.training.task_kwargs.max_degree + 1
-        )
-        excess_tensors["coefs"] = torch.empty(
-            0, args.training.task_kwargs.max_degree + 1
-        )
-        excess_tensors_eval["coefs"] = torch.empty(
-            0, args.training.task_kwargs.max_degree + 1
-        )
-    elif args.training.task == "polynomials_deg2_monomials_selection_unbiased":
-        # make a list of all the deg 2 monomial term indices
-        # for n_dims = 20, there are 20 + 190 terms: [[0, 0], [1, 1],...,[19, 19], [0, 1], [0, 2], ....[18, 19]]
-        all_deg2_terms = get_all_deg2_term_indices(n_dims)
-        args.training.task_kwargs["all_deg2_terms"] = all_deg2_terms
-        variant = args.training.task_kwargs["variant"]
-        if variant == "fixedK":
-            numDeg2Select = args.training.task_kwargs["numDeg2Select"]
-            sizeOfK = args.training.task_kwargs["sizeOfK"]
-            args.training.task_kwargs["fixedK"] = torch.tensor(
-                monomial_terms[f"{n_dims}-{sizeOfK}-{numDeg2Select}"], dtype=torch.int64
-            )
-    elif args.training.task == "gaussian_mixture_linear_regression":
-        mean = torch.zeros(size=(n_dims,))
-        mean[0] = args.training.task_kwargs["gaussian_centre_abs"]
-        cov = torch.eye(n_dims)
-        cov[0, 0] = 1e-8
-        distrib1 = MultivariateNormal(loc=mean, covariance_matrix=cov)
-        distrib2 = MultivariateNormal(loc=-mean, covariance_matrix=cov)
-        args.training.task_kwargs["distrib1"] = distrib1
-        args.training.task_kwargs["distrib2"] = distrib2
-    elif args.training.task == "haar_wavelets":
-        # create a dummy object to access haar methods
-        hw = HaarWavelets(n_dims=1, batch_size=4)
-        max_level = args.training.task_kwargs["max_level"]
-        # create the vectorized basis based on max_level of haar wavelets
-        vectorized_basis = [np.vectorize(f) for f in hw.haar_basis(max_level=max_level)]
-        args.training.task_kwargs["vectorized_basis"] = vectorized_basis
+    # excess_tensors_eval = {}
+    # if args.training.task == "polynomials_unbiased_points":
+    #     excess_tensors["tens"] = torch.empty(0, curriculum.n_points)
+    #     excess_tensors_eval["tens"] = torch.empty(
+    #         0, 2 * args.training.task_kwargs.max_degree + 1
+    #     )
+    #     excess_tensors["coefs"] = torch.empty(
+    #         0, args.training.task_kwargs.max_degree + 1
+    #     )
+    #     excess_tensors_eval["coefs"] = torch.empty(
+    #         0, args.training.task_kwargs.max_degree + 1
+    #     )
+    # elif args.training.task == "polynomials_deg2_monomials_selection_unbiased":
+    #     # make a list of all the deg 2 monomial term indices
+    #     # for n_dims = 20, there are 20 + 190 terms: [[0, 0], [1, 1],...,[19, 19], [0, 1], [0, 2], ....[18, 19]]
+    #     all_deg2_terms = get_all_deg2_term_indices(n_dims)
+    #     args.training.task_kwargs["all_deg2_terms"] = all_deg2_terms
+    #     variant = args.training.task_kwargs["variant"]
+    #     if variant == "fixedK":
+    #         numDeg2Select = args.training.task_kwargs["numDeg2Select"]
+    #         sizeOfK = args.training.task_kwargs["sizeOfK"]
+    #         args.training.task_kwargs["fixedK"] = torch.tensor(
+    #             monomial_terms[f"{n_dims}-{sizeOfK}-{numDeg2Select}"], dtype=torch.int64
+    #         )
+    # elif args.training.task == "gaussian_mixture_linear_regression":
+    #     mean = torch.zeros(size=(n_dims,))
+    #     mean[0] = args.training.task_kwargs["gaussian_centre_abs"]
+    #     cov = torch.eye(n_dims)
+    #     cov[0, 0] = 1e-8
+    #     distrib1 = MultivariateNormal(loc=mean, covariance_matrix=cov)
+    #     distrib2 = MultivariateNormal(loc=-mean, covariance_matrix=cov)
+    #     args.training.task_kwargs["distrib1"] = distrib1
+    #     args.training.task_kwargs["distrib2"] = distrib2
+    # elif args.training.task == "haar_wavelets":
+    #     # create a dummy object to access haar methods
+    #     hw = HaarWavelets(n_dims=1, batch_size=4)
+    #     max_level = args.training.task_kwargs["max_level"]
+    #     # create the vectorized basis based on max_level of haar wavelets
+    #     vectorized_basis = [np.vectorize(f) for f in hw.haar_basis(max_level=max_level)]
+    #     args.training.task_kwargs["vectorized_basis"] = vectorized_basis
 
     validateTaskKwargs(args)
     task_sampler = get_task_sampler(
@@ -390,19 +390,19 @@ def train(model, args):
 
         # import time
         # start = time.time()
-        if isinstance(task, PolynomialsUnbiasedPoints):
-            assert (
-                n_dims == 1
-            ), "n_dims is not 1, please change sampling logic for ys s.t. it is from same distribution as xs but is of shape [batch, n_points]"
-            # form the batch of ys w/ or w/o rejection sampling as needed
-            ys, _ = task.rejection_sample_to_form_batch(
-                xs,
-                data_sampler,
-                data_sampler_args,
-                bsize,
-                curriculum.n_points,
-                excess_tensors,
-            )
+        # if isinstance(task, PolynomialsUnbiasedPoints):
+        #     assert (
+        #         n_dims == 1
+        #     ), "n_dims is not 1, please change sampling logic for ys s.t. it is from same distribution as xs but is of shape [batch, n_points]"
+        #     # form the batch of ys w/ or w/o rejection sampling as needed
+        #     ys, _ = task.rejection_sample_to_form_batch(
+        #         xs,
+        #         data_sampler,
+        #         data_sampler_args,
+        #         bsize,
+        #         curriculum.n_points,
+        #         excess_tensors,
+        #     )
 
         ys = task.evaluate(xs)
 

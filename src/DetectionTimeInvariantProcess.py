@@ -20,7 +20,7 @@ import torch
 from tqdm.notebook import tqdm
 
 from eval import get_run_metrics, read_run_dir, get_model_from_run
-from plot_utils import basic_plot, collect_results, relevant_model_names
+# from plot_utils import basic_plot, collect_results, relevant_model_names
 from samplers import get_data_sampler
 from tasks import get_task_sampler, SparseLinearRegression
 from tasks import LinearRegression as LinearRegressionTask
@@ -97,7 +97,7 @@ params_dict_file = os.path.join('plots', f'params_dict_{task}_{run_id}.pickle')
 ray_errors_file = os.path.join('plots', f'ray_errors_{task}_{run_id}.npy')
 fading_errors_file = os.path.join('plots', f'fading_errors_{task}_{run_id}.npy')
 
-batch_size = 10000  # 1280 #conf.training.batch_size
+batch_size = 1280  # 1280 #conf.training.batch_size
 n_dims = 8
 seed = 43
 
@@ -108,7 +108,6 @@ demod_model.to(cuda_device)
 
 n_points = demod_conf.training.curriculum.points.end
 data_sampler = get_data_sampler(demod_conf.training.data, n_dims)
-
 
 
 torch.manual_seed(seed)
@@ -144,9 +143,6 @@ with torch.no_grad():
     mix_transformer_ray_logits = demod_model(xs.to(cuda_device), ray_ys.to(cuda_device)).cpu()
     print('Getting Fading Preds for Mixture Model')
     mix_transformer_fading_logits = demod_model(xs.to(cuda_device), fading_ys.to(cuda_device)).cpu()
-
-
-
 
 
 metric = ray_task.get_metric()
@@ -200,11 +196,11 @@ if args.save_predictions:
     np.save(fading_errors_file, tf_fading_CE, allow_pickle=False)
 
 
-np.save(f'../Files/Accuracy_one_ray_{task}.npy', tf_accuracy_one_ray)
-np.save(f'../Files/Accuracy_fading_{task}.npy', tf_accuracy_fading)
+np.save(f'../results/Accuracy_one_ray_{task}.npy', tf_accuracy_one_ray)
+np.save(f'../results/Accuracy_fading_{task}.npy', tf_accuracy_fading)
 
-np.save(f'../Files/CE_one_ray_{task}.npy', tf_ray_CE)
-np.save(f'../Files/CE_fading_{task}.npy', tf_fading_CE)
+np.save(f'../results/CE_one_ray_{task}.npy', tf_ray_CE)
+np.save(f'../results/CE_fading_{task}.npy', tf_fading_CE)
 
 # else:
     # with open(params_dict_file, mode='rb') as f:s
@@ -282,7 +278,7 @@ lineplot_with_ci(
     tf_ray_CE,
     n_points,
     offset=0,
-    label="LSTM",
+    label="Transformer",
     ax=ax1,
     seed=seed,
 )
@@ -324,7 +320,7 @@ lineplot_with_ci(
     tf_fading_CE,
     n_points,
     offset=0,
-    label="LSTM",
+    label="Transformer",
     ax=ax2,
     seed=seed,
 )
@@ -369,6 +365,6 @@ leg = ax2.legend(loc='upper right')
 for line in leg.get_lines():
     line.set_linewidth(5)
 numlines = len([file for file in [args.ray_context_file, args.ray_nocontext_file, args.fading_context_file, args.fading_nocontext_file] if file is not None])
-plt.savefig(f"../Plots/{args.task_name}_{numlines}_CE_LSTM.png", dpi=300, bbox_inches="tight")
+plt.savefig(f"../plots/{args.task_name}_{numlines}_cross_entropy.png", dpi=300, bbox_inches="tight")
 
 print('Done')
