@@ -2,15 +2,16 @@
 Official implementation of the paper: "Transformers are Provably Optimal In-context Estimators for Wireless Communcations"
 
 # Set-up
-Install the dependencies
+Install the dependencies and activate the environment using conda:
 
 ```bash 
-conda env create -f environment.yml
+conda env create -f environment.yml \\
+conda activate in-context-estimation
 ```
 
 Enter the directory
 ```bash 
-cd src/
+cd src
 ```
 
 Run the following for training:
