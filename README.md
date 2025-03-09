@@ -5,7 +5,7 @@ Official implementation of the paper: "Transformers are Provably Optimal In-cont
 Install the dependencies and activate the environment using conda:
 
 ```bash 
-conda env create -f environment.yml \\
+conda env create -f environment.yml
 conda activate in-context-estimation
 ```
 
