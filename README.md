@@ -31,6 +31,12 @@ python3 eval_time_variant_process.py <run-id> <task-name>
 ```
 for time varying process. The results are saved as `results/<task-name>.npy` and plots as `plots/<task-name>_<model-name>.png`.
 
+For the baselines, run:
+```bash
+cd traditional-methods/
+python3 baselines_time_invariant.py
+python3 baselines_time_variant.py
+```
 
 
 
