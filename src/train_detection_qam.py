@@ -206,34 +206,34 @@ def get_all_deg2_term_indices(n_dims):
     return all_deg2_terms
 
 
-def validateTaskKwargs(args):
-    taskName = args.training.task
-    task_kwargs = args.training.task_kwargs
-    if taskName == "polynomials_deg2_monomials_selection_unbiased":
-        variant = task_kwargs["variant"]
-        assert variant in ["fixedS", "fixedK", "randomS"], "invalid variant provided"
-        if variant == "fixedS":
-            assert (
-                len(task_kwargs["fixedS"]) == task_kwargs["numDeg2Select"]
-            ), "Length of fixed S is different from number of monomial degree 2 terms to be selected"
-            fixedS_array = np.array(task_kwargs["fixedS"])
-            assert np.all(
-                (0 <= fixedS_array) & (fixedS_array <= args.model.n_dims - 1)
-            ), "Some index in fixedS is out of bounds [0, n_dims-1]"
-        elif variant == "fixedK":
-            fixedK_array = np.array(task_kwargs["fixedK"])
-            assert fixedK_array.shape == (
-                task_kwargs["sizeOfK"],
-                task_kwargs["numDeg2Select"],
-                2,
-            ), "Shape of fixed K is different from (|K|, |S|, 2) as per config"
-            assert np.all(
-                (0 <= fixedK_array) & (fixedK_array <= args.model.n_dims - 1)
-            ), "For some S in fixedK, some index is out of bounds [0, n_dims-1]"
-        elif variant == "randomS":
-            assert task_kwargs["numDeg2Select"] < len(
-                task_kwargs["all_deg2_terms"]
-            ), "|S| must be less than the number of degree 2 terms"
+# def validateTaskKwargs(args):
+#     taskName = args.training.task
+#     task_kwargs = args.training.task_kwargs
+#     if taskName == "polynomials_deg2_monomials_selection_unbiased":
+#         variant = task_kwargs["variant"]
+#         assert variant in ["fixedS", "fixedK", "randomS"], "invalid variant provided"
+#         if variant == "fixedS":
+#             assert (
+#                 len(task_kwargs["fixedS"]) == task_kwargs["numDeg2Select"]
+#             ), "Length of fixed S is different from number of monomial degree 2 terms to be selected"
+#             fixedS_array = np.array(task_kwargs["fixedS"])
+#             assert np.all(
+#                 (0 <= fixedS_array) & (fixedS_array <= args.model.n_dims - 1)
+#             ), "Some index in fixedS is out of bounds [0, n_dims-1]"
+#         elif variant == "fixedK":
+#             fixedK_array = np.array(task_kwargs["fixedK"])
+#             assert fixedK_array.shape == (
+#                 task_kwargs["sizeOfK"],
+#                 task_kwargs["numDeg2Select"],
+#                 2,
+#             ), "Shape of fixed K is different from (|K|, |S|, 2) as per config"
+#             assert np.all(
+#                 (0 <= fixedK_array) & (fixedK_array <= args.model.n_dims - 1)
+#             ), "For some S in fixedK, some index is out of bounds [0, n_dims-1]"
+#         elif variant == "randomS":
+#             assert task_kwargs["numDeg2Select"] < len(
+#                 task_kwargs["all_deg2_terms"]
+#             ), "|S| must be less than the number of degree 2 terms"
 
 
 def train(model, args):
@@ -311,7 +311,7 @@ def train(model, args):
     #     vectorized_basis = [np.vectorize(f) for f in hw.haar_basis(max_level=max_level)]
     #     args.training.task_kwargs["vectorized_basis"] = vectorized_basis
 
-    validateTaskKwargs(args)
+    # validateTaskKwargs(args)
     task_sampler = get_task_sampler(
         args.training.task,
         n_dims,
@@ -338,32 +338,32 @@ def train(model, args):
         data_sampler_args = {}
         task_sampler_args = {}
 
-        if "sparse_linear_regression" in args.training.task:
-            task_sampler_args["valid_coords"] = curriculum.n_dims_truncated
-        if num_training_examples is not None:
-            assert num_training_examples >= bsize
-            seeds = sample_seeds(num_training_examples, bsize)
-            data_sampler_args["seeds"] = seeds
-            task_sampler_args["seeds"] = [s + 1 for s in seeds]
+        # if "sparse_linear_regression" in args.training.task:
+        #     task_sampler_args["valid_coords"] = curriculum.n_dims_truncated
+        # if num_training_examples is not None:
+        #     assert num_training_examples >= bsize
+        #     seeds = sample_seeds(num_training_examples, bsize)
+        #     data_sampler_args["seeds"] = seeds
+        #     task_sampler_args["seeds"] = [s + 1 for s in seeds]
 
-        if "fourier_series" in args.training.task:
-            args.training.task_kwargs["max_frequency"] = curriculum.max_freq
-            task_sampler = get_task_sampler(
-                args.training.task,
-                n_dims,
-                bsize,
-                num_tasks=args.training.num_tasks,
-                **args.training.task_kwargs,
-            )
-        elif args.training.task == "random_fourier_features":
-            args.training.task_kwargs["rff_dim"] = curriculum.rff_dim
-            task_sampler = get_task_sampler(
-                args.training.task,
-                n_dims,
-                bsize,
-                num_tasks=args.training.num_tasks,
-                **args.training.task_kwargs,
-            )
+        # if "fourier_series" in args.training.task:
+        #     args.training.task_kwargs["max_frequency"] = curriculum.max_freq
+        #     task_sampler = get_task_sampler(
+        #         args.training.task,
+        #         n_dims,
+        #         bsize,
+        #         num_tasks=args.training.num_tasks,
+        #         **args.training.task_kwargs,
+        #     )
+        # elif args.training.task == "random_fourier_features":
+        #     args.training.task_kwargs["rff_dim"] = curriculum.rff_dim
+        #     task_sampler = get_task_sampler(
+        #         args.training.task,
+        #         n_dims,
+        #         bsize,
+        #         num_tasks=args.training.num_tasks,
+        #         **args.training.task_kwargs,
+        #     )
 
         task = task_sampler(**task_sampler_args)
         # curriculum.n_points = (
@@ -643,18 +643,18 @@ def main(args):
         _ = get_run_metrics(args.out_dir)  # precompute metrics for eval
 
 
-def replaceTaskKwargs(args, taskKwargsToReplace):
-    if args.training.task in [
-        "polynomials_deg2_monomials_selection_unbiased",
-        "decision_tree",
-        "relu_2nn_regression",
-        "relu_2nn_regression_with_bias",
-    ]:
-        args.training.task_kwargs = Munch.fromDict(taskKwargsToReplace)
-        # n_points = (args.model.n_dims+1)*args.training.task_kwargs.hidden_layer_size+20
-        # args.model.n_positions = n_points
-        # args.training.curriculum.points.start = n_points
-        # args.training.curriculum.points.end = n_points
+# def replaceTaskKwargs(args, taskKwargsToReplace):
+#     if args.training.task in [
+#         "polynomials_deg2_monomials_selection_unbiased",
+#         "decision_tree",
+#         "relu_2nn_regression",
+#         "relu_2nn_regression_with_bias",
+#     ]:
+#         args.training.task_kwargs = Munch.fromDict(taskKwargsToReplace)
+#         # n_points = (args.model.n_dims+1)*args.training.task_kwargs.hidden_layer_size+20
+#         # args.model.n_positions = n_points
+#         # args.training.curriculum.points.start = n_points
+#         # args.training.curriculum.points.end = n_points
 
 
 def is_int_tryexcept(s):
