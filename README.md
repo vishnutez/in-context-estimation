@@ -16,7 +16,7 @@ cd src
 
 Run the following command for training:
 ```bash
-WANDB=offline python3 train_detection.py --config conf/<config-file-name>
+WANDB=offline python3 train_detection_qam.py --config conf/<config-file-name>
 ```
 
 where `<config-file-name>` represents the model to be trained in `conf/` folder.
