@@ -38,5 +38,17 @@ python3 baselines_time_invariant.py
 python3 baselines_time_variant.py
 ```
 
+## Citation
+
+```bibtex
+@inproceedings{
+kunde2025transformers,
+title={Transformers are Provably Optimal In-context Estimators for Wireless Communications},
+author={Vishnu Teja Kunde and Vicram Rajagopalan and Chandra Shekhara Kaushik Valmeekam and Krishna Narayanan and Jean-Francois Chamberland and Dileep Kalathil and Srinivas Shakkottai},
+booktitle={The 28th International Conference on Artificial Intelligence and Statistics},
+year={2025},
+url={https://openreview.net/forum?id=nhGtq5s6GJ}
+}
+```
 
 
