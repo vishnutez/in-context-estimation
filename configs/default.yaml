@@ -1,0 +1,45 @@
+task: detection
+
+modulation:
+  type: QAM           # QAM | PSK
+  signal_set_size: 16
+  n_tx_antennas: 1
+
+channel:
+  type: DopplerSpread  # RayleighBlockFading | DopplerSpread | CustomBlockFading
+  n_rx_antennas: 4
+  # Carrier frequency config (DopplerSpread only).
+  fc: 2.6e9 # in Hz
+  # Symbol duration config (DopplerSpread only).
+  symbol_duration: 1e-3 # in seconds
+  # Velocity config (DopplerSpread only). Use one of:
+  velocities: [5, 15, 30]   # finite set
+  #   velocity_min / velocity_max      # continuous uniform range
+  # velocity_min: 10
+  # velocity_max: 60
+
+snr:
+  min_db: 0.0
+  max_db: 0.0
+
+model:
+  n_embd: 256
+  n_layer: 6
+  n_head: 4
+  use_positional_embd: true
+
+training:
+  n_steps: 10_000_000
+  b_size: 64
+  n_points: 20
+  lr: 1.0e-4
+  log_every: 100
+  eval_every: 500
+  eval_b_size: 256
+  save_every: 500
+  checkpoint_dir: checkpoints
+  resume_from: null
+
+wandb:
+  project: in-context-estimation
+  run_name: null

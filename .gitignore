@@ -177,3 +177,9 @@ results/
 src-old/
 logs/
 traditional-methods-old/
+
+olympus_train.sbatch
+
+checkpoints/
+wandb/
+trash

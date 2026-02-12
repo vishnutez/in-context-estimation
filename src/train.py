@@ -1,864 +1,343 @@
+import math
 import os
 import sys
-from munch import Munch
-from random import randint
-import uuid
-
-from quinine import QuinineArgumentParser
-from tqdm import tqdm
-import numpy as np
 import torch
-import yaml
-
-from eval import get_run_metrics
-from tasks import get_task_sampler, PolynomialsUnbiasedPoints, HaarWavelets, LinearRegressionRegVecEst
-from samplers import get_data_sampler, sample_scale
-from curriculum import Curriculum
-from schema import schema
-from models import build_model, InverseProblemTransformerModel, InverseProblemBidirectionalTransformerModel
-from eval import eval_model, load_into_model_from_run
-from eval_encoders import bert_eval_with_masking
-import pickle
-from KS_monomial_sets import monomial_terms
-from torch.distributions.multivariate_normal import MultivariateNormal
-
+import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 import wandb
-import pdb
 
-torch.backends.cudnn.benchmark = True
+from models import TransformerModel
+from config import load_config, build_samplers
 
 
-def train_step(
-    model,
-    xs,
-    ys,
-    optimizer,
-    loss_func,
-    batch_idx,
-    max_train_steps,
-    k_steps_for_loss="all",
-    num_accum_steps=1,
-    masking=None,
-    masking_method=None,
-    ws_targets=None
-):
-    # masking: None by default, for no masking.
-    # For any other value, a mask index will be prepended to x and y.
-    # "x": y's will not be masked. Some x's will be masked. The number
-    # of x's masked is determined by masking_method.
-    # The masked samples could be anywhere in the sequence, not necessarily at the beginning
-    # and not necessarily contiguous.
-    # Only the masked elements will be used in loss calculation.
-    # The same mask is used for all sequences in the batch.
-    # For now, other options are not implemented.
-    # NOTE: for inverse problems, keep in mind that the x and y used here are pre-swap.
-    # masking_method: if "uniform", n_mask is selected uniformly at random, between 1 and n_points.
-    # Otherwise, this is interpreted as a positive int, which will be n_mask.
-    if masking is not None:
-        assert masking_method is not None
-        bsize, n_points, xdim = xs.shape
-        assert ys.shape[0] == bsize
-        assert ys.shape[1] == n_points
-        ydim = ys.shape[2]
-        if masking == "x":
-            if masking_method == "uniform":
-                n_mask = np.random.choice(n_points) + 1
-            else:
-                n_mask = int(masking_method)
-                assert n_mask > 0
-            mask_indices = np.random.choice(a=n_points, size=(n_mask,), replace=False)
-            # Masked elements have a nonzero value in the zeroth dim, unmasked elements have a 0.
-            y_mask = torch.zeros(bsize, n_points, 1, dtype=ys.dtype, device=ys.device)
-            x_mask_single = torch.zeros(1, n_points, 1, dtype=xs.dtype, device=xs.device)
-            x_mask_single[0, mask_indices, 0] = 1
-            x_mask = torch.tile(x_mask_single, (bsize, 1, 1))
-            assert x_mask.shape == (bsize, n_points, 1)
+def complex_to_real(z):
+    """Convert (..., d) complex tensor to (..., 2*d) real by stacking [real, imag]."""
+    return torch.cat([z.real, z.imag], dim=-1)
 
-            xs = torch.cat([x_mask, xs], dim=2)
-            assert xs.shape == (bsize, n_points, xdim + 1)
 
-            ys = torch.cat([y_mask, ys], dim=2)
-            assert ys.shape == (bsize, n_points, ydim + 1)
-        else:
-            raise NotImplementedError("The only masking option available is 'x'.")
+def generate_batch(modulation_sampler, channel_sampler, b_size, n_points, snr_min_db, snr_max_db, seeds=None):
+    """Generate a batch of transmitted signals, channels, and received signals.
 
-    # optimizer.zero_grad()
-    output = model(xs, ys)  # output is ws if RegEst task is chosen
-    # print('Output = ', output.shape)
-    if isinstance(model, InverseProblemTransformerModel) or isinstance(model, InverseProblemBidirectionalTransformerModel):
-        # Swap xs and ys for the purpose of loss computation.
-        # TODO: better long-term solution
-        tmp = xs
-        xs = ys
-        ys = tmp
+    Args:
+        seeds: optional list of b_size integer seeds for reproducible evaluation batches.
 
-    bsize, n_points, n_dims = xs.shape
+    Returns:
+        xs:         (b, n, t) complex64 — transmitted symbols
+        signal_ids: (b, n, t) long      — indices into the signal set
+        ys:         (b, n, r) complex64  — received signals (with noise)
+        snr_db:     (b,) float           — per-element SNR in dB
+    """
+    # Transmitted symbols
+    xs, signal_ids = modulation_sampler.sample(n_points, b_size, seeds=seeds)  # (b, n, t), (b, n, t)
 
-    if masking is not None:
-        if masking == "x":
-            # We are now using post-swap variables, so this corresponds to the y's.
-            bsize, n_points, out_dim = output.shape
-            assert ys.shape == (bsize, n_points, out_dim + 1)
-            # NOTE: torch.nonzero could be used to find the indices which were masked.
-            # However, it's easier to just use mask_indices, which we already have.
-            output_masked_subset = output[:, mask_indices, :]
-            # Do the same for ys, but also remove the mask dim.
-            ys_masked_subset = ys[:, mask_indices, 1:]
-            assert output_masked_subset.shape == ys_masked_subset.shape
-            loss = loss_func(output_masked_subset, ys_masked_subset)
+    # Channel realizations
+    hs = channel_sampler.sample(b_size, n_points, seeds=seeds)  # (b, n, r, t)
 
-        else:
-            raise NotImplementedError("The only masking option available is 'x'.")
-    elif k_steps_for_loss == "all":
-        if ws_targets is not None:
-            loss = loss_func(output, ws_targets.to(xs.device)) 
-            # print('Computing loss on ws!')
-        else:
-            loss = loss_func(output, ys)    
+    # Noiseless received signal: y = H x
+    ys_noiseless = torch.einsum('bnrt,bnt->bnr', hs, xs)  # (b, n, r)
+
+    # Sample SNR per batch element (fixed if min == max, otherwise uniform)
+    if seeds is not None:
+        generator = torch.Generator()
+        generator.manual_seed(sum(seeds))
     else:
-        if ws_targets is not None:
-            loss = loss_func(
-                output[:, -int(k_steps_for_loss) :], ys[:, -int(k_steps_for_loss) :]
-            )
-        else:
-            loss = loss_func(
-                output[:, -int(k_steps_for_loss) :], ys[:, -int(k_steps_for_loss) :]
-            )
+        generator = None
 
-    # normalize loss to account for batch accumulation
-    loss = loss / num_accum_steps
+    if snr_min_db == snr_max_db:
+        snr_db = torch.full((b_size,), snr_min_db)
+    elif seeds is not None:
+        snr_db = torch.rand(b_size, generator=generator) * (snr_max_db - snr_min_db) + snr_min_db
+    else:
+        snr_db = torch.rand(b_size) * (snr_max_db - snr_min_db) + snr_min_db
+    snr_linear = 10 ** (snr_db / 10)  # (b,)
 
-    loss.backward()
-    # optimizer.step()
+    # Additive complex Gaussian noise: n ~ CN(0, (1/snr) * I)
+    noise_std = (1.0 / torch.sqrt(2.0 * snr_linear)).view(b_size, 1, 1)  # (b, 1, 1)
+    n_rx = ys_noiseless.shape[-1]
+    noise = noise_std * (torch.randn(b_size, n_points, n_rx, generator=generator)
+                         + 1j * torch.randn(b_size, n_points, n_rx, generator=generator))
 
-    if ((batch_idx + 1) % num_accum_steps == 0) or (batch_idx + 1 == max_train_steps):
-        optimizer.step()
-        optimizer.zero_grad()
+    ys = ys_noiseless + noise  # (b, n, r)
 
-    return loss.detach().item(), output.detach()
-
-
-def sample_seeds(total_seeds, count):
-    seeds = set()
-    while len(seeds) < count:
-        seeds.add(randint(0, total_seeds - 1))
-    return seeds
+    return xs, signal_ids, ys, snr_db
 
 
-def wandb_log_task(task, metrics_task, baseline_loss, point_wise_tags, step, suffix=""):
-    wandb.log(
-        {
-            f"{task}_eval{suffix}/overall_loss": np.mean(metrics_task["mean"]),
-            f"{task}_eval{suffix}/excess_loss": np.mean(metrics_task["mean"])
-            / baseline_loss,
-            f"{task}_eval{suffix}/pointwise/loss": dict(
-                zip(point_wise_tags, metrics_task["mean"])
-            ),
-        },
-        step=step,
+@torch.no_grad()
+def evaluate(model, modulation_sampler, channel_sampler, task, b_size, n_points,
+             snr_min_db, snr_max_db, device, eval_seeds):
+    """Evaluate model on a fixed (seeded) dataset.
+
+    Returns a dict of metrics: eval/loss, and eval/accuracy (for detection) or eval/mse (for estimation).
+    """
+    model.eval()
+
+    n_tx = modulation_sampler.n_tx_antennas
+    signal_set_size = modulation_sampler.signal_set_size
+
+    xs, signal_ids, ys, snr_db = generate_batch(
+        modulation_sampler, channel_sampler, b_size, n_points, snr_min_db, snr_max_db, seeds=eval_seeds
     )
 
+    xs_real = complex_to_real(xs).to(device)
+    ys_real = complex_to_real(ys).to(device)
 
-def get_n_points_eval(task, n_dims, task_kwargs, curriculum):
-    return curriculum.n_points_schedule.end
-    # n_points_eval = 0
-    # if 'polynomials_deg2_monomials_selection' in task:
-    #     n_points_eval = curriculum.n_points_schedule.end
-    # elif 'polynomials' == task or 'polynomials_unbiased_points' == task:
-    #     # n_points_eval = 2 * task_kwargs.max_degree + 1
-    #     n_points_eval = curriculum.n_points_schedule.end
-    # elif "_cs" not in task:
-    #     # n_points_eval = 2 * n_dims + 1
-    #     # TODO: if we choose to log the inf-norm-optimization performance while training then this will break when n_points_eval > current value of input dimensions + 1
-    #     # This is because inf-norm-optimization LPP is feasible only when n_points_eval <= current value of input dimension + 1
-    #     # Remedy for this is to use a different n_points_eval value for each solver such that it is always feasible
-    #     n_points_eval = curriculum.n_points_schedule.end
-    # else:
-    #     n_points_eval = curriculum.n_points_schedule.end
-    # return n_points_eval
+    pred = model(xs_real, ys_real)
 
-
-def get_training_optimizer(model, args):
-    optimizer = None
-    if args.model.train_only_emb:
-        # set requires_grad=False for all params
-        for param in model.parameters():
-            param.requires_grad = False
-
-        # set requires_grad=True for model._read_in i.e. embedding layer
-        for param in model._read_in.parameters():
-            param.requires_grad = True
-
-        # pass only the params with requires_grad=True to the optimizer
-        optimizer = torch.optim.Adam(
-            filter(lambda p: p.requires_grad, model.parameters()),
-            lr=args.training.learning_rate,
+    metrics = {}
+    if task == "detection":
+        logits = pred.view(b_size, n_points, n_tx, signal_set_size)
+        loss = F.cross_entropy(
+            logits.reshape(-1, signal_set_size),
+            signal_ids.to(device).reshape(-1),
         )
-    else:
-        optimizer = torch.optim.Adam(model.parameters(), lr=args.training.learning_rate)
-    return optimizer
+        predicted_ids = logits.argmax(dim=-1)  # (b, n, t)
+        accuracy = (predicted_ids == signal_ids.to(device)).float().mean()
+        metrics["eval/loss"] = loss.item()
+        metrics["eval/accuracy"] = accuracy.item()
+    else:  # estimation
+        loss = F.mse_loss(pred, xs_real)
+        metrics["eval/loss"] = loss.item()
+        metrics["eval/mse"] = loss.item()
 
-
-def get_all_deg2_term_indices(n_dims):
-    all_deg2_terms = []
-    for i in range(n_dims):
-        all_deg2_terms.append([i, i])
-        for j in range(i + 1, n_dims):
-            all_deg2_terms.append([i, j])
-    return all_deg2_terms
-
-
-def validateTaskKwargs(args):
-    taskName = args.training.task
-    task_kwargs = args.training.task_kwargs
-    if taskName == "polynomials_deg2_monomials_selection_unbiased":
-        variant = task_kwargs["variant"]
-        assert variant in ["fixedS", "fixedK", "randomS"], "invalid variant provided"
-        if variant == "fixedS":
-            assert (
-                len(task_kwargs["fixedS"]) == task_kwargs["numDeg2Select"]
-            ), "Length of fixed S is different from number of monomial degree 2 terms to be selected"
-            fixedS_array = np.array(task_kwargs["fixedS"])
-            assert np.all(
-                (0 <= fixedS_array) & (fixedS_array <= args.model.n_dims - 1)
-            ), "Some index in fixedS is out of bounds [0, n_dims-1]"
-        elif variant == "fixedK":
-            fixedK_array = np.array(task_kwargs["fixedK"])
-            assert fixedK_array.shape == (
-                task_kwargs["sizeOfK"],
-                task_kwargs["numDeg2Select"],
-                2,
-            ), "Shape of fixed K is different from (|K|, |S|, 2) as per config"
-            assert np.all(
-                (0 <= fixedK_array) & (fixedK_array <= args.model.n_dims - 1)
-            ), "For some S in fixedK, some index is out of bounds [0, n_dims-1]"
-        elif variant == "randomS":
-            assert task_kwargs["numDeg2Select"] < len(
-                task_kwargs["all_deg2_terms"]
-            ), "|S| must be less than the number of degree 2 terms"
-
-
-def train(model, args):
-    optimizer = get_training_optimizer(model, args)
-    curriculum = Curriculum(args.training.curriculum)
-
-    starting_step = 0
-    state_path = os.path.join(args.out_dir, "state.pt")
-    if os.path.exists(state_path):
-        state = torch.load(state_path)
-        model.load_state_dict(state["model_state_dict"])
-        optimizer.load_state_dict(state["optimizer_state_dict"])
-        starting_step = state["train_step"]
-        for i in range(state["train_step"] + 1):
-            curriculum.update()
-    n_dims = model.n_dims
-    bsize = args.training.batch_size
-    if args.training.data_transformation_args is not None:
-        scale = sample_scale(
-            method=args.training.data_transformation_args.get("method", None),
-            n_dims=n_dims,
-            normalize=args.training.data_transformation_args.get("normalize", False),
-            seed=args.training.data_transformation_args.get("seed", None),
-        )
-    else:
-        scale = None
-
-    data_kwargs = args.training.data_kwargs
-    if args.training.data == "gaussian":
-        if data_kwargs is None:
-            data_kwargs = {}
-        data_kwargs.update({"scale": scale})
-
-    data_sampler = get_data_sampler(args.training.data, n_dims=n_dims, **data_kwargs)
-
-    excess_tensors = {}
-    excess_tensors_eval = {}
-    if args.training.task == "polynomials_unbiased_points":
-        excess_tensors["tens"] = torch.empty(0, curriculum.n_points)
-        excess_tensors_eval["tens"] = torch.empty(
-            0, 2 * args.training.task_kwargs.max_degree + 1
-        )
-        excess_tensors["coefs"] = torch.empty(
-            0, args.training.task_kwargs.max_degree + 1
-        )
-        excess_tensors_eval["coefs"] = torch.empty(
-            0, args.training.task_kwargs.max_degree + 1
-        )
-    elif args.training.task == "polynomials_deg2_monomials_selection_unbiased":
-        # make a list of all the deg 2 monomial term indices
-        # for n_dims = 20, there are 20 + 190 terms: [[0, 0], [1, 1],...,[19, 19], [0, 1], [0, 2], ....[18, 19]]
-        all_deg2_terms = get_all_deg2_term_indices(n_dims)
-        args.training.task_kwargs["all_deg2_terms"] = all_deg2_terms
-        variant = args.training.task_kwargs["variant"]
-        if variant == "fixedK":
-            numDeg2Select = args.training.task_kwargs["numDeg2Select"]
-            sizeOfK = args.training.task_kwargs["sizeOfK"]
-            args.training.task_kwargs["fixedK"] = torch.tensor(
-                monomial_terms[f"{n_dims}-{sizeOfK}-{numDeg2Select}"], dtype=torch.int64
-            )
-    elif args.training.task == "gaussian_mixture_linear_regression":
-        mean = torch.zeros(size=(n_dims,))
-        mean[0] = args.training.task_kwargs["gaussian_centre_abs"]
-        cov = torch.eye(n_dims)
-        cov[0, 0] = 1e-8
-        distrib1 = MultivariateNormal(loc=mean, covariance_matrix=cov)
-        distrib2 = MultivariateNormal(loc=-mean, covariance_matrix=cov)
-        args.training.task_kwargs["distrib1"] = distrib1
-        args.training.task_kwargs["distrib2"] = distrib2
-    elif args.training.task == "haar_wavelets":
-        # create a dummy object to access haar methods
-        hw = HaarWavelets(n_dims=1, batch_size=4)
-        max_level = args.training.task_kwargs["max_level"]
-        # create the vectorized basis based on max_level of haar wavelets
-        vectorized_basis = [np.vectorize(f) for f in hw.haar_basis(max_level=max_level)]
-        args.training.task_kwargs["vectorized_basis"] = vectorized_basis
-
-    validateTaskKwargs(args)
-    task_sampler = get_task_sampler(
-        args.training.task,
-        n_dims,
-        bsize,
-        num_tasks=args.training.num_tasks,
-        **args.training.task_kwargs,
-    )
-    pbar = tqdm(range(starting_step, args.training.train_steps))
-    # log also when i+1 == args.training.train_steps
-
-    num_training_examples = args.training.num_training_examples
-    num_accum_steps = args.training.num_accum_steps
-    optimizer.zero_grad()
-    log_loss = 0.0
-    log_point_wise_loss = 0.0
-    # outputs_list = []
-    for i in pbar:
-        if i % num_accum_steps == 0:
-            log_loss = 0.0
-            log_point_wise_loss = torch.zeros(
-                size=(curriculum.n_points,), dtype=torch.float32
-            ).cuda()
-
-        data_sampler_args = {}
-        task_sampler_args = {}
-
-        if "sparse_linear_regression" in args.training.task:
-            task_sampler_args["valid_coords"] = curriculum.n_dims_truncated
-        if num_training_examples is not None:
-            assert num_training_examples >= bsize
-            seeds = sample_seeds(num_training_examples, bsize)
-            data_sampler_args["seeds"] = seeds
-            task_sampler_args["seeds"] = [s + 1 for s in seeds]
-
-        if "fourier_series" in args.training.task:
-            args.training.task_kwargs["max_frequency"] = curriculum.max_freq
-            task_sampler = get_task_sampler(
-                args.training.task,
-                n_dims,
-                bsize,
-                num_tasks=args.training.num_tasks,
-                **args.training.task_kwargs,
-            )
-        elif args.training.task == "random_fourier_features":
-            args.training.task_kwargs["rff_dim"] = curriculum.rff_dim
-            task_sampler = get_task_sampler(
-                args.training.task,
-                n_dims,
-                bsize,
-                num_tasks=args.training.num_tasks,
-                **args.training.task_kwargs,
-            )
-
-        task = task_sampler(**task_sampler_args)
-        # curriculum.n_points = (
-        #     task.get_bound() + 1 if "_cs" in args.training.task else curriculum.n_points
-        # )
-        xs = data_sampler.sample_xs(
-            curriculum.n_points,
-            bsize,
-            curriculum.n_dims_truncated,
-            **data_sampler_args,
-        )
-
-        ws = None  # initialize reg estimations with None
-
-        # import time
-        # start = time.time()
-        if isinstance(task, PolynomialsUnbiasedPoints):
-            assert (
-                n_dims == 1
-            ), "n_dims is not 1, please change sampling logic for ys s.t. it is from same distribution as xs but is of shape [batch, n_points]"
-            # form the batch of ys w/ or w/o rejection sampling as needed
-            ys, _ = task.rejection_sample_to_form_batch(
-                xs,
-                data_sampler,
-                data_sampler_args,
-                bsize,
-                curriculum.n_points,
-                excess_tensors,
-            )
-        elif isinstance(task, LinearRegressionRegVecEst):
-            ys, ws = task.evaluate(xs)  # sample ws (of shape (bsize, n_dims, 1))
-        else:
-            ys = task.evaluate(xs)
-        # end = time.time()
-        # print("time",end - start)
-        # outputs_list.append(ys)
-        # fname='save_op.pkl'
-        # if i % 1000 == 0:
-        #     with open(fname, 'wb') as handle:
-        #         pickle.dump(outputs_list, handle, protocol=pickle.HIGHEST_PROTOCOL)
-
-
-        if ws is not None:
-            # ws is of shape (bsize, n_dims, 1), ws.T is of shape (bsize, 1, n_dims)
-            ws_transpose = torch.transpose(ws, -1,-2)
-            # print('ws_transpose = ', ws_transpose.shape)
-            ws_targets = torch.tile(ws_transpose, (1, curriculum.n_points, 1))
-            # print('ws_targets = ', ws_targets.shape)
-        else:
-            ws_targets = None
-
-        loss_func = task.get_training_metric()
-        loss, output = train_step(
-            model,
-            xs.cuda(),
-            ys.cuda(),
-            optimizer,
-            loss_func,
-            batch_idx=i,
-            max_train_steps=args.training.train_steps,
-            k_steps_for_loss=args.training.k_steps_for_loss,
-            num_accum_steps=num_accum_steps,
-            masking=args.training.masking,
-            masking_method=args.training.masking_method,
-            ws_targets=ws_targets,
-        )
-
-        log_loss += loss
-        point_wise_tags = list(range(curriculum.n_points))
-        point_wise_loss_func = task.get_metric()
-
-        if isinstance(model, InverseProblemBidirectionalTransformerModel):
-            # For the BERT model, the output during training is with training
-            # masking applied. For fair comparison, we must recompute the output
-            # with different masking.
-            output = bert_eval_with_masking(model, xs.cuda(), ys.cuda()).detach()
-
-        if isinstance(model, InverseProblemTransformerModel) or isinstance(model, InverseProblemBidirectionalTransformerModel):
-            # Swap xs and ys for the purpose of loss computation.
-            # TODO: better long-term solution
-            point_wise_loss = point_wise_loss_func(output, xs.cuda()).mean(dim=0)
-        elif model.is_estimation:
-            # print('In correct loss computation')
-            point_wise_loss = point_wise_loss_func(output, ws_targets.cuda()).mean(dim=(0, 2))
-        else:
-            point_wise_loss = point_wise_loss_func(output, ys.cuda()).mean(dim=0)
-        point_wise_loss = point_wise_loss / num_accum_steps
-        log_point_wise_loss += point_wise_loss
-        baseline_loss = (
-            sum(
-                max(curriculum.n_dims_truncated - ii, 0)
-                for ii in range(curriculum.n_points)
-            )
-            / curriculum.n_points
-        )
-        if args.training.task in ["demodulation", "demodulation_time_varying"]:
-            # Baseline loss computation assumes that the problem is linear regression, which this is not.
-            # For this task, just set excess_loss = log_loss.
-            baseline_loss = 1.0
-
-        if (
-            i + 1 == num_accum_steps
-            or (  # first log when num_accum_steps are over -- this is equiv. to log at step=0 for non-accumulation training
-                i > 0 and (i + 1) % args.wandb.log_every_steps == 0
-            )
-            or i + 1  # log during training whenever we pass the logging interval
-            == args.training.train_steps
-        ) and not args.test_run:  # log at the last train step
-            wandb.log(
-                {
-                    "overall_loss": log_loss,
-                    "excess_loss": log_loss / baseline_loss,
-                    "pointwise/loss": dict(
-                        zip(point_wise_tags, log_point_wise_loss.cpu().numpy())
-                    ),
-                    "n_points": curriculum.n_points,
-                    "n_dims": curriculum.n_dims_truncated,
-                    "max_freq": curriculum.max_freq,
-                    "rff_dim": curriculum.rff_dim,
-                },
-                step=(i + 1) // num_accum_steps,
-            )
-
-        if (
-            i + 1 == num_accum_steps
-            or (  # first log when num_accum_steps are over -- this is equiv. to log at step=0 for non-accumulation training
-                i > 0 and (i + 1) % args.training.eval_every_steps == 0
-            )
-            or i + 1  # log during training whenever we pass the logging interval
-            == args.training.train_steps
-        ) and not args.test_run:  # log at the last train step
-            if args.training.task == "two_task_mixer":
-                task1 = args.training.task_kwargs.get("task1", "linear_regression")
-                task2 = args.training.task_kwargs.get("task2", "decision_tree")
-                task_spec_params_dict = args.training.task_kwargs.get(
-                    "task_spec_params_dict", {}
-                )
-                task1_kwargs = task_spec_params_dict.get(task1, {})
-                task2_kwargs = task_spec_params_dict.get(task2, {})
-
-                metrics_task1 = eval_model(
-                    model,
-                    task_name=task1,
-                    data_name=args.training.data,
-                    n_dims=args.model.n_dims,
-                    n_points=get_n_points_eval(
-                        task1, args.model.n_dims, task1_kwargs, curriculum
-                    ),
-                    prompting_strategy="standard",
-                    batch_size=64,
-                    data_sampler_kwargs=data_kwargs,
-                    task_sampler_kwargs=task1_kwargs,
-                )
-
-                metrics_task2 = eval_model(
-                    model,
-                    task_name=task2,
-                    data_name=args.training.data,
-                    n_dims=args.model.n_dims,
-                    n_points=get_n_points_eval(
-                        task2, args.model.n_dims, task2_kwargs, curriculum
-                    ),
-                    prompting_strategy="standard",
-                    batch_size=64,
-                    data_sampler_kwargs=data_kwargs,
-                    task_sampler_kwargs=task2_kwargs,
-                )
-                wandb_log_task(
-                    task1,
-                    metrics_task1,
-                    baseline_loss,
-                    point_wise_tags,
-                    step=(i + 1) // num_accum_steps,
-                )
-                wandb_log_task(
-                    task2,
-                    metrics_task2,
-                    baseline_loss,
-                    point_wise_tags,
-                    step=(i + 1) // num_accum_steps,
-                )
-
-            elif args.training.task == "three_task_mixer":
-                task1 = args.training.task_kwargs.get("task1", "linear_regression")
-                task2 = args.training.task_kwargs.get("task2", "decision_tree")
-                task3 = args.training.task_kwargs.get("task3", "relu_2nn_regression")
-
-                task_spec_params_dict = args.training.task_kwargs.get(
-                    "task_spec_params_dict", {}
-                )
-                task1_kwargs = task_spec_params_dict.get(task1, {})
-                task2_kwargs = task_spec_params_dict.get(task2, {})
-                task3_kwargs = task_spec_params_dict.get(task3, {})
-
-                metrics_task1 = eval_model(
-                    model,
-                    task_name=task1,
-                    data_name=args.training.data,
-                    n_dims=args.model.n_dims,
-                    n_points=get_n_points_eval(
-                        task1, args.model.n_dims, task1_kwargs, curriculum
-                    ),
-                    prompting_strategy="standard",
-                    batch_size=64,
-                    data_sampler_kwargs=data_kwargs,
-                    task_sampler_kwargs=task1_kwargs,
-                )
-
-                metrics_task2 = eval_model(
-                    model,
-                    task_name=task2,
-                    data_name=args.training.data,
-                    n_dims=args.model.n_dims,
-                    n_points=get_n_points_eval(
-                        task2, args.model.n_dims, task2_kwargs, curriculum
-                    ),
-                    prompting_strategy="standard",
-                    batch_size=64,
-                    data_sampler_kwargs=data_kwargs,
-                    task_sampler_kwargs=task2_kwargs,
-                )
-
-                metrics_task3 = eval_model(
-                    model,
-                    task_name=task3,
-                    data_name=args.training.data,
-                    n_dims=args.model.n_dims,
-                    n_points=get_n_points_eval(
-                        task3, args.model.n_dims, task3_kwargs, curriculum
-                    ),
-                    prompting_strategy="standard",
-                    batch_size=64,
-                    data_sampler_kwargs=data_kwargs,
-                    task_sampler_kwargs=task3_kwargs,
-                )
-
-                wandb_log_task(
-                    task1,
-                    metrics_task1,
-                    baseline_loss,
-                    point_wise_tags,
-                    step=(i + 1) // num_accum_steps,
-                )
-                wandb_log_task(
-                    task2,
-                    metrics_task2,
-                    baseline_loss,
-                    point_wise_tags,
-                    step=(i + 1) // num_accum_steps,
-                )
-                wandb_log_task(
-                    task3,
-                    metrics_task3,
-                    baseline_loss,
-                    point_wise_tags,
-                    step=(i + 1) // num_accum_steps,
-                )
-
-            else:
-                n_dims = args.model.n_dims
-                metrics = eval_model(
-                    model,
-                    task_name=args.training.task,
-                    data_name=args.training.data,
-                    n_dims=args.model.n_dims,
-                    n_points=get_n_points_eval(
-                        args.training.task,
-                        args.model.n_dims,
-                        args.training.task_kwargs,
-                        curriculum,
-                    ),
-                    prompting_strategy="standard",
-                    batch_size=64,
-                    data_sampler_kwargs=data_kwargs,
-                    task_sampler_kwargs=args.training.task_kwargs,
-                    excess_tensors_eval=excess_tensors_eval,
-                )
-
-                wandb_log_task(
-                    args.training.task,
-                    metrics,
-                    baseline_loss,
-                    point_wise_tags,
-                    step=(i + 1) // num_accum_steps,
-                )
-
-                if args.training.eval_ood:
-                    assert args.training.task in [
-                        "polynomials_deg2_monomials_selection_unbiased"
-                    ], "task is not in the list of tasks for OOD evaluation"
-                    metrics_ood = eval_model(
-                        model,
-                        task_name=args.training.task,
-                        data_name=args.training.data,
-                        n_dims=args.model.n_dims,
-                        n_points=get_n_points_eval(
-                            args.training.task,
-                            args.model.n_dims,
-                            args.training.task_kwargs,
-                            curriculum,
-                        ),
-                        prompting_strategy="standard",
-                        batch_size=64,
-                        data_sampler_kwargs=data_kwargs,
-                        task_sampler_kwargs=args.training.task_kwargs,
-                        excess_tensors_eval=excess_tensors_eval,
-                        eval_ood=True,
-                    )
-                    wandb_log_task(
-                        args.training.task,
-                        metrics_ood,
-                        baseline_loss,
-                        point_wise_tags,
-                        step=(i + 1) // num_accum_steps,
-                        suffix="_ood",
-                    )
-
-                # wandb.log(
-                #     {
-                #         # f"in-context-score@{curriculum.n_points//4 + 1}": metrics["mean"][
-                #         #     curriculum.n_points // 4
-                #         # ],
-                #         # f"in-context-score@{curriculum.n_points//2 + 1}": metrics["mean"][
-                #         #     curriculum.n_points // 2
-                #         # ],
-                #         # f"in-context-score@{3 * curriculum.n_points//4 + 1}": metrics[
-                #         #     "mean"
-                #         # ][3 * curriculum.n_points // 4],
-                #         f"in-context-score@{curriculum.n_points}": metrics["mean"][
-                #             curriculum.n_points - 1
-                #         ]
-                #         # f"in-context-score@{int(1.5*curriculum.n_points)}": metrics["mean"][
-                #         #     int(1.5 * curriculum.n_points)
-                #         # ],
-                #         # f"in-context-score@{int(2*curriculum.n_points)}": metrics["mean"][
-                #         #     int(2 * curriculum.n_points)
-                #         # f"in-context-score@{-1}": metrics["mean"][-1],
-                #         # f"in-context-score@{n_dims//2}": metrics["mean"][n_dims // 2],
-                #         # f"in-context-score@{n_dims}": metrics["mean"][n_dims],
-                #         # f"in-context-score@{int(1.5*n_dims)}": metrics["mean"][
-                #         #     int(1.5 * n_dims)
-                #         # ],
-                #         # f"in-context-score@{int(2*n_dims)}": metrics["mean"][
-                #         #     int(2 * n_dims)
-                #     },
-                #     step=i,
-                # )
-
-        curriculum.update()
-
-        pbar.set_description(f"loss {loss}")
-        if (
-            i % args.training.save_every_steps == 0
-            or i + 1 == args.training.train_steps
-        ) and not args.test_run:
-            training_state = {
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "train_step": i,
-            }
-            torch.save(training_state, state_path)
-
-        if (
-            args.training.keep_every_steps > 0
-            and (
-                i % args.training.keep_every_steps == 0
-                or i + 1 == args.training.train_steps
-            )
-            and not args.test_run
-            and i > 0
-        ):
-            torch.save(model.state_dict(), os.path.join(args.out_dir, f"model_{i}.pt"))
-
-
-def main(args):
-    if args.test_run:
-        curriculum_args = args.training.curriculum
-        curriculum_args.points.start = curriculum_args.points.end
-        curriculum_args.dims.start = curriculum_args.dims.end
-        args.training.train_steps = 100
-    else:
-        wandb.init(
-            dir=args.out_dir,
-            project=args.wandb.project,
-            entity=args.wandb.entity,
-            config=args.__dict__,
-            notes=args.wandb.notes,
-            name=args.wandb.name,
-            resume=True,
-        )
-
-    
-
-    model = build_model(args.model)
-    if args.model.load_model_path is not None:
-        run_path = os.path.join(
-            "../models", args.training.task, args.model.load_model_path
-        )
-        load_into_model_from_run(model, run_path)
-    model.cuda()
     model.train()
-
-    train(model, args)
-
-    if not args.test_run:
-        _ = get_run_metrics(args.out_dir)  # precompute metrics for eval
+    return metrics
 
 
-def replaceTaskKwargs(args, taskKwargsToReplace):
-    if args.training.task in [
-        "polynomials_deg2_monomials_selection_unbiased",
-        "decision_tree",
-        "relu_2nn_regression",
-        "relu_2nn_regression_with_bias",
-    ]:
-        args.training.task_kwargs = Munch.fromDict(taskKwargsToReplace)
-        # n_points = (args.model.n_dims+1)*args.training.task_kwargs.hidden_layer_size+20
-        # args.model.n_positions = n_points
-        # args.training.curriculum.points.start = n_points
-        # args.training.curriculum.points.end = n_points
+def save_checkpoint(model, optimizer, step, wandb_run_id, checkpoint_dir, distributed=False):
+    """Save training checkpoint to disk."""
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    raw_model = model.module if distributed else model
+    checkpoint = {
+        "step": step,
+        "model_state_dict": raw_model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "wandb_run_id": wandb_run_id,
+    }
+    path = os.path.join(checkpoint_dir, f"checkpoint_{step}.pt")
+    torch.save(checkpoint, path)
+    # Also save as "latest" for easy resume
+    latest_path = os.path.join(checkpoint_dir, "checkpoint_latest.pt")
+    torch.save(checkpoint, latest_path)
+    print(f"  [ckpt] saved checkpoint at step {step} -> {path}")
 
 
-def is_int_tryexcept(s):
-    """Returns int(s) if s is an integer-string else returns s."""
-    try:
-        int(s)
-        return int(s)
-    except ValueError:
-        return s
+def load_checkpoint(path, model, optimizer, device):
+    """Load a training checkpoint. Returns the step to resume from and the wandb_run_id."""
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    step = checkpoint["step"]
+    wandb_run_id = checkpoint.get("wandb_run_id")
+    print(f"  [ckpt] resumed from {path} at step {step}")
+    return step, wandb_run_id
 
 
-def convertToNumber(keyVal):
-    key = is_int_tryexcept(keyVal[0])
-    val = is_int_tryexcept(keyVal[1])
-    return [key, val]
+def setup_distributed():
+    """Initialize distributed process group. Returns (rank, world_size, device)."""
+    dist.init_process_group(backend="nccl")
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    device = torch.device(f"cuda:{local_rank}")
+    torch.cuda.set_device(device)
+    return rank, world_size, device
 
 
-def extractTaskKwargsFromCliArgs():
-    # if sys.argv contains task_kwargs return it as a dict else return None
-    # A string 'foo=bar,number=6' is made into a dict {'foo': 'bar', 'number': 6}
-    # Note that only integer-strings are converted to int; float-strings remain as-is
-    # for more complex and nested dict structures, this function does not work
-    cli_args = sys.argv[1:]
-    task_kwargs_str = None
-    task_kwargs = None
-    for i in range(len(cli_args)):
-        if cli_args[i] == "--training.task_kwargs":
-            task_kwargs_str = cli_args[i + 1]
-            del sys.argv[i + 1]
-            del sys.argv[i + 1]
-            break
+def cleanup_distributed():
+    """Destroy the distributed process group."""
+    dist.destroy_process_group()
 
-    if task_kwargs_str is not None:
-        # convert keys and values into ints where possible
-        task_kwargs = dict(
-            convertToNumber(pair.split("=")) for pair in task_kwargs_str.split(",")
+
+def train(cfg, modulation_sampler, channel_sampler):
+    """Train a TransformerModel for MIMO detection or estimation.
+
+    Args:
+        cfg:                 config dict (from load_config)
+        modulation_sampler:  ModulationSampler instance
+        channel_sampler:     ChannelSampler instance
+    """
+    # Unpack config sections
+    task = cfg["task"]
+    tc = cfg["training"]
+    mc = cfg["model"]
+    sc = cfg["snr"]
+    wc = cfg["wandb"]
+
+    n_steps = tc["n_steps"]
+    b_size = tc["b_size"]
+    n_points = tc["n_points"]
+    lr = tc["lr"]
+    log_every = tc["log_every"]
+    eval_every = tc["eval_every"]
+    eval_b_size = tc["eval_b_size"]
+    save_every = tc["save_every"]
+    checkpoint_dir = tc["checkpoint_dir"]
+    resume_from = tc["resume_from"]
+
+    snr_min_db = sc["min_db"]
+    snr_max_db = sc["max_db"]
+
+    n_embd = mc["n_embd"]
+    n_layer = mc["n_layer"]
+    n_head = mc["n_head"]
+    use_positional_embd = mc["use_positional_embd"]
+
+    wandb_project = wc["project"]
+    wandb_run_name = wc["run_name"]
+
+    # Auto-generate run name if not specified
+    if wandb_run_name is None:
+        mean_snr = (snr_min_db + snr_max_db) / 2
+        mod_type = cfg["modulation"]["type"]
+        ch_type = cfg["channel"]["type"]
+        wandb_run_name = (
+            f"embd={n_embd}_nl={n_layer}_nh={n_head}"
+            f"_snr_db={mean_snr:.0f}"
+            f"_task={task}"
+            f"_mod={mod_type.lower()}"
+            f"_ch={ch_type.lower()}"
         )
 
-    return task_kwargs
+    # Save checkpoints under checkpoint_dir/run_name/
+    checkpoint_dir = os.path.join(checkpoint_dir, wandb_run_name)
 
+    # Distributed setup
+    distributed = int(os.environ.get("WORLD_SIZE", 1)) > 1
+    if distributed:
+        rank, world_size, device = setup_distributed()
+    else:
+        rank, world_size = 0, 1
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def updateStepsByGradAccumSteps(args):
-    num_accum_steps = args.training.num_accum_steps
-    args.training.train_steps *= num_accum_steps
-    args.training.eval_every_steps *= num_accum_steps
-    args.training.save_every_steps *= num_accum_steps
-    args.training.keep_every_steps *= num_accum_steps
+    n_tx = modulation_sampler.n_tx_antennas
+    n_rx = channel_sampler.n_rx_antennas
+    signal_set_size = modulation_sampler.signal_set_size
 
-    args.training.curriculum.dims.interval *= num_accum_steps
-    args.training.curriculum.points.interval *= num_accum_steps
+    # Model dimensions
+    x_dim = 2 * n_tx
+    y_dim = 2 * n_rx
+    n_dims = max(x_dim, y_dim)
+    n_positions = 2 * n_points  # interleaved (x, y) pairs
 
-    args.wandb.log_every_steps *= num_accum_steps
+    if task == "detection":
+        n_dims_out = signal_set_size * n_tx
+    elif task == "estimation":
+        n_dims_out = 2 * n_tx
+    else:
+        raise ValueError(f"Unknown task: {task!r}. Expected 'detection' or 'estimation'.")
+
+    model = TransformerModel(
+        n_dims=n_dims,
+        n_positions=n_positions,
+        n_embd=n_embd,
+        n_layer=n_layer,
+        n_head=n_head,
+        n_dims_out=n_dims_out,
+        use_positional_embd=use_positional_embd,
+    ).to(device)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    # Resume from checkpoint (before DDP wrapping so we load into the raw model)
+    start_step = 0
+    wandb_run_id = None
+    if resume_from is not None:
+        start_step, wandb_run_id = load_checkpoint(resume_from, model, optimizer, device)
+
+    if distributed:
+        model = DDP(model, device_ids=[device])
+
+    # Initialize wandb on rank 0 only
+    if rank == 0:
+        wandb_kwargs = {
+            "project": wandb_project,
+            "config": cfg,
+        }
+        if wandb_run_id is not None:
+            # Resume the exact same wandb run
+            wandb_kwargs["id"] = wandb_run_id
+            wandb_kwargs["resume"] = "must"
+            print(f"  [wandb] resuming run {wandb_run_id}")
+        else:
+            wandb_kwargs["name"] = wandb_run_name
+
+        wandb.init(**wandb_kwargs)
+        # Store the run id so we can save it in checkpoints
+        wandb_run_id = wandb.run.id
+
+    # Fixed seeds for reproducible evaluation
+    eval_seeds = list(range(eval_b_size))
+
+    for step in range(start_step + 1, n_steps + 1):
+        model.train()
+
+        # Each rank generates its own independent batch
+        xs, signal_ids, ys, snr_db = generate_batch(
+            modulation_sampler, channel_sampler, b_size, n_points, snr_min_db, snr_max_db
+        )
+
+        # Convert complex to stacked real
+        xs_real = complex_to_real(xs).to(device)   # (b, n, 2*t)
+        ys_real = complex_to_real(ys).to(device)   # (b, n, 2*r)
+
+        # Forward pass: pred shape (b, n, n_dims_out)
+        pred = model(xs_real, ys_real)
+
+        # Compute loss
+        if task == "detection":
+            logits = pred.view(b_size, n_points, n_tx, signal_set_size)
+            loss = F.cross_entropy(
+                logits.reshape(-1, signal_set_size),
+                signal_ids.to(device).reshape(-1),
+            )
+        else:  # estimation
+            loss = F.mse_loss(pred, xs_real)
+
+        # Backward pass (DDP synchronizes gradients automatically)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        # Log training metrics
+        if rank == 0 and (step % log_every == 0 or step == 1):
+            train_metrics = {"train/loss": loss.item(), "train/step": step}
+            if task == "detection":
+                with torch.no_grad():
+                    train_acc = (logits.argmax(dim=-1) == signal_ids.to(device)).float().mean()
+                train_metrics["train/accuracy"] = train_acc.item()
+            wandb.log(train_metrics, step=step)
+            print(f"step {step:>6d}/{n_steps} | loss: {loss.item():.4f}")
+
+        # Evaluate periodically
+        if rank == 0 and (step % eval_every == 0):
+            eval_model = model.module if distributed else model
+            eval_metrics = evaluate(
+                eval_model, modulation_sampler, channel_sampler, task,
+                eval_b_size, n_points, snr_min_db, snr_max_db, device, eval_seeds,
+            )
+            wandb.log(eval_metrics, step=step)
+            eval_summary = " | ".join(f"{k}: {v:.4f}" for k, v in eval_metrics.items())
+            print(f"  [eval] {eval_summary}")
+
+        # Save checkpoint periodically
+        if rank == 0 and (step % save_every == 0):
+            save_checkpoint(model, optimizer, step, wandb_run_id, checkpoint_dir, distributed)
+
+    # Final checkpoint
+    if rank == 0:
+        save_checkpoint(model, optimizer, n_steps, wandb_run_id, checkpoint_dir, distributed)
+        wandb.finish()
+
+    if distributed:
+        cleanup_distributed()
+
+    # Return the unwrapped model
+    return model.module if distributed else model
 
 
 if __name__ == "__main__":
-    # taskKwargsToReplace = extractTaskKwargsFromCliArgs()
-    parser = QuinineArgumentParser(schema=schema)
-    args = parser.parse_quinfig()
-    # replaceTaskKwargs(args, taskKwargsToReplace)
-    assert args.model.family in ["gpt2", "lstm", "gpt2_inverse_problem", "bert_inverse_problem", "gpt2_estimation"]
-    print(f"Running with: {args}")
-    updateStepsByGradAccumSteps(args)
-    if not args.test_run:
-        run_id = args.training.resume_id
-        if run_id is None:
-            run_id = str(uuid.uuid4())
-
-        out_dir = os.path.join(args.out_dir, run_id)
-        if not os.path.exists(out_dir):
-            os.makedirs(out_dir)
-        args.out_dir = out_dir
-
-        with open(os.path.join(out_dir, "config.yaml"), "w") as yaml_file:
-            yaml.dump(args.__dict__, yaml_file, default_flow_style=False)
-
-    main(args)
+    config_path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(__file__), "..", "configs", "default.yaml")
+    cfg = load_config(config_path)
+    modulation_sampler, channel_sampler = build_samplers(cfg)
+    train(cfg, modulation_sampler, channel_sampler)
