@@ -9,7 +9,7 @@ channel:
   type: DopplerSpread  # RayleighBlockFading | DopplerSpread | CustomBlockFading
   n_rx_antennas: 4
   # Carrier frequency config (DopplerSpread only).
-  fc: 2.6e9 # in Hz
+  fc: 2.9e9 # in Hz
   # Symbol duration config (DopplerSpread only).
   symbol_duration: 1e-3 # in seconds
   # Velocity config (DopplerSpread only). Use one of:
