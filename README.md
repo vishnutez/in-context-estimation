@@ -73,10 +73,13 @@ training:
   n_steps: 10_000_000
   b_size: 64
   n_points: 20
+  min_n_points: null          # curriculum start; null = no curriculum
+  curriculum_steps: null      # ramp n_points from min_n_points to n_points over this many steps
   lr: 1.0e-4
   log_every: 100
   eval_every: 500
   save_every: 500
+  max_checkpoints: 5          # keep at most N numbered checkpoints; null = keep all
   checkpoint_dir: checkpoints
   resume_from: null           # path to checkpoint_latest.pt to resume
 
@@ -84,6 +87,17 @@ wandb:
   project: in-context-estimation
   run_name: null              # auto-generated if null
 ```
+
+## Resuming from Checkpoint
+
+Set `resume_from` to a checkpoint path in your config:
+
+```yaml
+training:
+  resume_from: checkpoints/<run_name>/checkpoint_latest.pt
+```
+
+The wandb run ID is saved inside each checkpoint, so the original wandb run is automatically resumed -- no manual ID management needed.
 
 ## Project Structure
 

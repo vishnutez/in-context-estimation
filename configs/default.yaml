@@ -29,14 +29,17 @@ model:
   use_positional_embd: true
 
 training:
-  n_steps: 10_000_000
+  n_steps: 1_000_000
   b_size: 64
   n_points: 20
   lr: 1.0e-4
   log_every: 100
   eval_every: 500
   eval_b_size: 256
-  save_every: 500
+  min_n_points: 5            # curriculum start; null = no curriculum (always use n_points)
+  curriculum_steps: 100_000         # linearly ramp n_points from min_n_points to n_points over this many steps
+  save_every: 10_000
+  max_checkpoints: 20            # keep at most N numbered checkpoints; null = keep all
   checkpoint_dir: checkpoints
   resume_from: null
 

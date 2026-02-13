@@ -11,6 +11,16 @@ from models import TransformerModel
 from config import load_config, build_samplers
 
 
+def get_curriculum_n_points(step, n_points, min_n_points, curriculum_steps):
+    """Linearly ramp from min_n_points to n_points over curriculum_steps."""
+    if min_n_points is None or curriculum_steps is None:
+        return n_points
+    if step >= curriculum_steps:
+        return n_points
+    frac = step / curriculum_steps
+    return max(min_n_points, int(min_n_points + frac * (n_points - min_n_points)))
+
+
 def complex_to_real(z):
     """Convert (..., d) complex tensor to (..., 2*d) real by stacking [real, imag]."""
     return torch.cat([z.real, z.imag], dim=-1)
@@ -104,8 +114,8 @@ def evaluate(model, modulation_sampler, channel_sampler, task, b_size, n_points,
     return metrics
 
 
-def save_checkpoint(model, optimizer, step, wandb_run_id, checkpoint_dir, distributed=False):
-    """Save training checkpoint to disk."""
+def save_checkpoint(model, optimizer, step, wandb_run_id, checkpoint_dir, distributed=False, max_checkpoints=None):
+    """Save training checkpoint to disk, removing oldest if max_checkpoints is exceeded."""
     os.makedirs(checkpoint_dir, exist_ok=True)
     raw_model = model.module if distributed else model
     checkpoint = {
@@ -120,6 +130,15 @@ def save_checkpoint(model, optimizer, step, wandb_run_id, checkpoint_dir, distri
     latest_path = os.path.join(checkpoint_dir, "checkpoint_latest.pt")
     torch.save(checkpoint, latest_path)
     print(f"  [ckpt] saved checkpoint at step {step} -> {path}")
+
+    # Prune old checkpoints (keep checkpoint_latest.pt separate)
+    if max_checkpoints is not None:
+        import glob
+        numbered = sorted(glob.glob(os.path.join(checkpoint_dir, "checkpoint_[0-9]*.pt")))
+        while len(numbered) > max_checkpoints:
+            oldest = numbered.pop(0)
+            os.remove(oldest)
+            print(f"  [ckpt] removed old checkpoint {oldest}")
 
 
 def load_checkpoint(path, model, optimizer, device):
@@ -172,8 +191,13 @@ def train(cfg, modulation_sampler, channel_sampler):
     eval_every = tc["eval_every"]
     eval_b_size = tc["eval_b_size"]
     save_every = tc["save_every"]
+    max_checkpoints = tc.get("max_checkpoints")
     checkpoint_dir = tc["checkpoint_dir"]
     resume_from = tc["resume_from"]
+
+    # Curriculum: ramp n_points from min_n_points -> n_points over curriculum_steps
+    min_n_points = tc.get("min_n_points")
+    curriculum_steps = tc.get("curriculum_steps")
 
     snr_min_db = sc["min_db"]
     snr_max_db = sc["max_db"]
@@ -197,6 +221,8 @@ def train(cfg, modulation_sampler, channel_sampler):
             f"_task={task}"
             f"_mod={mod_type.lower()}"
             f"_ch={ch_type.lower()}"
+            f"_min_n_points={min_n_points}"
+            f"_curriculum_steps={curriculum_steps}"
         )
 
     # Save checkpoints under checkpoint_dir/run_name/
@@ -272,27 +298,37 @@ def train(cfg, modulation_sampler, channel_sampler):
     for step in range(start_step + 1, n_steps + 1):
         model.train()
 
+        # Curriculum: compute current n_points for training
+        n_points_train = get_curriculum_n_points(step, n_points, min_n_points, curriculum_steps)
+
         # Each rank generates its own independent batch
         xs, signal_ids, ys, snr_db = generate_batch(
-            modulation_sampler, channel_sampler, b_size, n_points, snr_min_db, snr_max_db
+            modulation_sampler, channel_sampler, b_size, n_points_train, snr_min_db, snr_max_db
         )
 
         # Convert complex to stacked real
-        xs_real = complex_to_real(xs).to(device)   # (b, n, 2*t)
-        ys_real = complex_to_real(ys).to(device)   # (b, n, 2*r)
+        xs_real = complex_to_real(xs).to(device)   # (b, n_points_train, 2*t)
+        ys_real = complex_to_real(ys).to(device)   # (b, n_points_train, 2*r)
 
-        # Forward pass: pred shape (b, n, n_dims_out)
+        # Right-pad to n_points so model input size is always fixed
+        if n_points_train < n_points:
+            pad_len = n_points - n_points_train
+            xs_real = F.pad(xs_real, (0, 0, 0, pad_len))  # (b, n_points, 2*t)
+            ys_real = F.pad(ys_real, (0, 0, 0, pad_len))  # (b, n_points, 2*r)
+
+        # Forward pass: pred shape (b, n_points, n_dims_out)
         pred = model(xs_real, ys_real)
 
-        # Compute loss
+        # Compute loss only on the first n_points_train positions
+        pred_active = pred[:, :n_points_train]
         if task == "detection":
-            logits = pred.view(b_size, n_points, n_tx, signal_set_size)
+            logits = pred_active.view(b_size, n_points_train, n_tx, signal_set_size)
             loss = F.cross_entropy(
                 logits.reshape(-1, signal_set_size),
                 signal_ids.to(device).reshape(-1),
             )
         else:  # estimation
-            loss = F.mse_loss(pred, xs_real)
+            loss = F.mse_loss(pred_active, xs_real[:, :n_points_train])
 
         # Backward pass (DDP synchronizes gradients automatically)
         optimizer.zero_grad()
@@ -301,13 +337,13 @@ def train(cfg, modulation_sampler, channel_sampler):
 
         # Log training metrics
         if rank == 0 and (step % log_every == 0 or step == 1):
-            train_metrics = {"train/loss": loss.item(), "train/step": step}
+            train_metrics = {"train/loss": loss.item(), "train/step": step, "train/n_points": n_points_train}
             if task == "detection":
                 with torch.no_grad():
                     train_acc = (logits.argmax(dim=-1) == signal_ids.to(device)).float().mean()
                 train_metrics["train/accuracy"] = train_acc.item()
             wandb.log(train_metrics, step=step)
-            print(f"step {step:>6d}/{n_steps} | loss: {loss.item():.4f}")
+            print(f"step {step:>6d}/{n_steps} | loss: {loss.item():.4f} | n_pts: {n_points_train}")
 
         # Evaluate periodically
         if rank == 0 and (step % eval_every == 0):
@@ -322,11 +358,11 @@ def train(cfg, modulation_sampler, channel_sampler):
 
         # Save checkpoint periodically
         if rank == 0 and (step % save_every == 0):
-            save_checkpoint(model, optimizer, step, wandb_run_id, checkpoint_dir, distributed)
+            save_checkpoint(model, optimizer, step, wandb_run_id, checkpoint_dir, distributed, max_checkpoints)
 
     # Final checkpoint
     if rank == 0:
-        save_checkpoint(model, optimizer, n_steps, wandb_run_id, checkpoint_dir, distributed)
+        save_checkpoint(model, optimizer, n_steps, wandb_run_id, checkpoint_dir, distributed, max_checkpoints)
         wandb.finish()
 
     if distributed:
