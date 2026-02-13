@@ -43,6 +43,9 @@ class QAMSampler(ModulationSampler):
         grid_i, grid_q = torch.meshgrid(levels, levels, indexing="ij")
         signal_set = (grid_i.reshape(-1) + 1j * grid_q.reshape(-1)).to(torch.complex64)
 
+        # Normalize the signal set to have unit variance
+        signal_set = signal_set / torch.std(signal_set)
+
         super().__init__(signal_set=signal_set, n_tx_antennas=n_tx_antennas)
 
 
@@ -51,6 +54,10 @@ class PSKSampler(ModulationSampler):
         # Create a PSK signal set as unit-magnitude points on the complex plane -> (signal_set_size,) complex64
         angles = torch.arange(signal_set_size, dtype=torch.float32) * (2 * math.pi / signal_set_size)
         signal_set = (torch.cos(angles) + 1j * torch.sin(angles)).to(torch.complex64)
+
+        # Normalize the signal set to have unit variance
+        signal_set = signal_set / torch.std(signal_set)
+
         super().__init__(signal_set=signal_set, n_tx_antennas=n_tx_antennas)
 
 

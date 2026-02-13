@@ -221,6 +221,7 @@ def train(cfg, modulation_sampler, channel_sampler):
             f"_task={task}"
             f"_mod={mod_type.lower()}"
             f"_ch={ch_type.lower()}"
+            f"_pos_embd={use_positional_embd}"
             f"_min_n_points={min_n_points}"
             f"_curriculum_steps={curriculum_steps}"
         )
