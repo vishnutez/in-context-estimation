@@ -293,8 +293,8 @@ def train(cfg, modulation_sampler, channel_sampler):
         # Store the run id so we can save it in checkpoints
         wandb_run_id = wandb.run.id
 
-    # Fixed seeds for reproducible evaluation
-    eval_seeds = list(range(eval_b_size))
+    # eval_seeds = list(range(eval_b_size))  # fixed seeds for reproducible evaluation
+    eval_seeds = None  # random evaluation batches each time
 
     for step in range(start_step + 1, n_steps + 1):
         model.train()
