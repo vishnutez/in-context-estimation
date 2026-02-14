@@ -349,6 +349,13 @@ def train(cfg, modulation_sampler, channel_sampler):
         # Evaluate periodically
         if rank == 0 and (step % eval_every == 0):
             eval_model = model.module if distributed else model
+            with torch.no_grad():
+                # Sanity: eval the SAME training batch
+                pred_check = eval_model(xs_real, ys_real)
+                logits_check = pred_check[:, :n_points_train].view(b_size, n_points_train, n_tx, signal_set_size)
+                loss_check = F.cross_entropy(logits_check.reshape(-1, signal_set_size), signal_ids.to(device).reshape(-1))
+                print(f"  [sanity] train_loss={loss.item():.4f}  same_batch_eval_loss={loss_check.item():.4f}")
+                wandb.log({"sanity/train_loss": loss.item(), "sanity/eval_loss": loss_check.item()}, step=step)
             eval_metrics = evaluate(
                 eval_model, modulation_sampler, channel_sampler, task,
                 eval_b_size, n_points, snr_min_db, snr_max_db, device, eval_seeds,
