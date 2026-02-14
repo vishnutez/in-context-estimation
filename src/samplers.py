@@ -151,18 +151,19 @@ class DopplerSpreadChannelSampler(ChannelSampler):
 
     def sample(self, b_size, n_points, seeds=None):
         channels = torch.zeros(b_size, n_points, self.n_rx_antennas, self.n_tx_antennas, dtype=torch.complex64)
-        generator = torch.Generator()
 
         if seeds is not None:
+            generator = torch.Generator()
             assert len(seeds) == b_size
             for i, seed in enumerate(seeds):
                 generator.manual_seed(seed)
                 v = self._sample_velocity(generator)
                 channels[i] = self._sample_single(n_points, v, generator)
         else:
+            # Use global RNG when seeds not provided
             for i in range(b_size):
-                v = self._sample_velocity(generator)
-                channels[i] = self._sample_single(n_points, v, generator)
+                v = self._sample_velocity()
+                channels[i] = self._sample_single(n_points, v)
 
         return channels
 
